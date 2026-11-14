@@ -854,7 +854,8 @@ class TxlemetryFlutterPlugin :
 
         lastBuiltConfig = config
         TxlemetryAndroid.setup(applicationContext, config)
-        txlemetryConfig = config
+        // The parameter of setupTxlemetry shadows the field after the rename; store the built config in the field.
+        this.txlemetryConfig = config
         cachedReplayIntegration = null
         capturePushNotificationOpenedFromLaunchIntent()
     }
