@@ -1,0 +1,4 @@
+packages:
+  - txlemetry_flutter
+
+minimumReleaseAge: 10080

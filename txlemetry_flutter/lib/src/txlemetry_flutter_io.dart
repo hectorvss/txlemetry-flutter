@@ -1,0 +1,987 @@
+import 'dart:async';
+
+import 'util/platform_io_stub.dart'
+    if (dart.library.io) 'util/platform_io_real.dart';
+
+import 'package:flutter/services.dart';
+
+import 'package:txlemetry_flutter/src/surveys/survey_service.dart';
+import 'package:txlemetry_flutter/src/util/logging.dart';
+import 'surveys/models/txlemetry_display_survey.dart' as models;
+import 'surveys/models/survey_callbacks.dart';
+import 'error_tracking/dart_exception_processor.dart';
+import 'utils/before_send.dart';
+import 'utils/capture_utils.dart';
+import 'utils/flutter_version.dart';
+import 'utils/property_normalizer.dart';
+
+import 'feature_flag_result.dart';
+import 'logs/txlemetry_log_severity.dart';
+import 'txlemetry_config.dart';
+import 'txlemetry_constants.dart';
+import 'txlemetry_event.dart';
+import 'txlemetry_flutter_platform_interface.dart';
+import 'txlemetry_internal_events.dart';
+
+/// An implementation of [TxlemetryFlutterPlatformInterface] that uses method channels.
+class TxlemetryFlutterIO extends TxlemetryFlutterPlatformInterface {
+  TxlemetryFlutterIO() {
+    _methodChannel.setMethodCallHandler(_handleMethodCall);
+  }
+
+  /// The method channel used to interact with the native platform.
+  final _methodChannel = const MethodChannel('txlemetry_flutter');
+
+  OnFeatureFlagsCallback? _onFeatureFlagsCallback;
+
+  PushIdentityProvider? _pushIdentityProvider;
+
+  /// Stored configuration for accessing inAppIncludes and other settings
+  TxlemetryConfig? _config;
+
+  /// Stored beforeSend callbacks for dropping/modifying events
+  List<BeforeSendCallback> _beforeSendCallbacks = [];
+
+  /// Applies the beforeSend callbacks to an event in order.
+  /// Returns the possibly modified event, or null if any callback drops it.
+  Future<TxlemetryEvent?> _runBeforeSend(
+    String eventName,
+    Map<String, Object>? properties, {
+    Map<String, Object>? userProperties,
+    Map<String, Object>? userPropertiesSetOnce,
+  }) {
+    return applyBeforeSend(
+      _beforeSendCallbacks,
+      TxlemetryEvent(
+        event: eventName,
+        properties: properties,
+        userProperties: userProperties,
+        userPropertiesSetOnce: userPropertiesSetOnce,
+      ),
+    );
+  }
+
+  /// Native plugin calls to Flutter
+  ///
+  Future<dynamic> _handleMethodCall(MethodCall call) async {
+    switch (call.method) {
+      case 'showSurvey':
+        final survey = Map<String, dynamic>.from(call.arguments);
+        return showSurvey(survey);
+      case 'hideSurveys':
+        await cleanupSurveys();
+        return null;
+      case 'onFeatureFlagsCallback':
+        _onFeatureFlagsCallback?.call();
+        break;
+      case 'pushIdentityProvider':
+        // Returning a value here is the reply the native SDK awaits.
+        final provider = _pushIdentityProvider;
+        if (provider == null) {
+          printIfDebug(
+              'pushIdentityProvider invoked but no provider is configured; push subscription will be sent unauthenticated.');
+          return null;
+        }
+        try {
+          final arguments = Map<String, Object?>.from(call.arguments as Map);
+          return await provider(
+            arguments['distinctId'] as String? ?? '',
+            arguments['appId'] as String? ?? '',
+          );
+        } catch (exception) {
+          printIfDebug('Exception on pushIdentityProvider: $exception');
+          return null;
+        }
+      case 'onNativeOcclusionChanged':
+        final arguments = Map<String, dynamic>.from(call.arguments as Map);
+        TxlemetryInternalEvents.nativeOcclusionActive =
+            arguments['occluded'] == true;
+        TxlemetryInternalEvents.nativeOcclusionEpisode =
+            arguments['episode'] as int? ?? 0;
+        TxlemetryInternalEvents.nativeBridgeFailed =
+            arguments['bridgeFailed'] == true;
+        TxlemetryInternalEvents.nativeOcclusionEvent.value++;
+        break;
+      default:
+        printIfDebug(
+          '[Txlemetry] ${call.method} not implemented in TxlemetryFlutterPlatformInterface',
+        );
+        return null;
+    }
+  }
+
+  @override
+  Future<void> showSurvey(Map<String, dynamic> survey) async {
+    if (!isSupportedPlatform()) {
+      printIfDebug('Cannot show survey: Platform is not supported');
+      return;
+    }
+
+    final widget = TxlemetryFlutterPlatformInterface.instance;
+    if (widget is! TxlemetryFlutterIO) {
+      printIfDebug(
+        'Cannot show survey: TxlemetryFlutterPlatformInterface instance is not TxlemetryFlutterIO',
+      );
+      return;
+    }
+
+    final displaySurvey = models.TxlemetryDisplaySurvey.fromDict(survey);
+
+    // Try to show using SurveyService
+    // This will work if the user has set up the TxlemetryObserver correctly in their app
+    await SurveyService().showSurvey(
+      displaySurvey,
+      (survey) async {
+        // onShown
+        try {
+          await _methodChannel.invokeMethod('surveyAction', {
+            'type': 'shown',
+            'presentationId': survey.presentationId,
+          });
+        } on PlatformException catch (exception) {
+          printIfDebug('Exception on surveyAction(shown): $exception');
+        }
+      },
+      (survey, index, response) async {
+        // onResponse
+        try {
+          final result = await _methodChannel.invokeMethod('surveyAction', {
+            'type': 'response',
+            'presentationId': survey.presentationId,
+            'index': index,
+            'response': response,
+          }) as Map?;
+          if (result == null) return null;
+          return TxlemetrySurveyNextQuestion(
+            questionIndex: (result['nextIndex'] as num).toInt(),
+            isSurveyCompleted: result['isSurveyCompleted'] as bool,
+          );
+        } on PlatformException catch (exception) {
+          printIfDebug('Exception on surveyAction(response): $exception');
+          if (exception.code == 'SurveyInvalidated') {
+            SurveyService().hideSurvey(survey: survey);
+          }
+        }
+
+        return null;
+      },
+      (survey) async {
+        // onClose
+        try {
+          await _methodChannel.invokeMethod('surveyAction', {
+            'type': 'closed',
+            'presentationId': survey.presentationId,
+          });
+        } on PlatformException catch (exception) {
+          printIfDebug('Exception on surveyAction(closed): $exception');
+        }
+      },
+    );
+  }
+
+  /// Cleans up any active surveys when the survey feature is stopped
+  Future<void> cleanupSurveys() async {
+    if (!isSupportedPlatform()) {
+      printIfDebug('Cannot cleanup surveys: Platform is not supported');
+      return;
+    }
+
+    SurveyService().hideSurvey();
+  }
+
+  /// Flutter to Native Calls
+  ///
+  @override
+  Future<void> setup(TxlemetryConfig config) async {
+    // Store config for later use in exception processing
+    _config = config;
+
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    _onFeatureFlagsCallback = config.onFeatureFlags;
+    _pushIdentityProvider = config.pushIdentityProvider;
+    _beforeSendCallbacks = config.beforeSend;
+
+    try {
+      await _methodChannel.invokeMethod('setup', {
+        ...config.toMap(),
+        ...flutterVersionSetupArguments(),
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on setup: $exception');
+    }
+  }
+
+  @override
+  Future<void> setCaptureNativeScreens(bool enabled) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+    try {
+      await _methodChannel.invokeMethod(
+        'setCaptureNativeScreens',
+        {'enabled': enabled},
+      );
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setCaptureNativeScreens: $exception');
+    }
+  }
+
+  @override
+  Future<void> identify({
+    required String userId,
+    Map<String, Object>? userProperties,
+    Map<String, Object>? userPropertiesSetOnce,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedUserProperties = userProperties != null
+          ? PropertyNormalizer.normalize(userProperties)
+          : null;
+      final normalizedUserPropertiesSetOnce = userPropertiesSetOnce != null
+          ? PropertyNormalizer.normalize(userPropertiesSetOnce)
+          : null;
+
+      await _methodChannel.invokeMethod('identify', {
+        'userId': userId,
+        if (normalizedUserProperties != null)
+          'userProperties': normalizedUserProperties,
+        if (normalizedUserPropertiesSetOnce != null)
+          'userPropertiesSetOnce': normalizedUserPropertiesSetOnce,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on identify: $exception');
+    }
+  }
+
+  @override
+  Future<void> setPersonProperties({
+    Map<String, Object>? userPropertiesToSet,
+    Map<String, Object>? userPropertiesToSetOnce,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedUserPropertiesToSet = userPropertiesToSet != null
+          ? PropertyNormalizer.normalize(userPropertiesToSet)
+          : null;
+      final normalizedUserPropertiesToSetOnce = userPropertiesToSetOnce != null
+          ? PropertyNormalizer.normalize(userPropertiesToSetOnce)
+          : null;
+
+      await _methodChannel.invokeMethod('setPersonProperties', {
+        if (normalizedUserPropertiesToSet != null)
+          'userPropertiesToSet': normalizedUserPropertiesToSet,
+        if (normalizedUserPropertiesToSetOnce != null)
+          'userPropertiesToSetOnce': normalizedUserPropertiesToSetOnce,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setPersonProperties: $exception');
+    }
+  }
+
+  @override
+  Future<void> capture({
+    required String eventName,
+    Map<String, Object>? properties,
+    Map<String, Object>? userProperties,
+    Map<String, Object>? userPropertiesSetOnce,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    // Apply beforeSend callback
+    final processedEvent = await _runBeforeSend(
+      eventName,
+      properties,
+      userProperties: userProperties,
+      userPropertiesSetOnce: userPropertiesSetOnce,
+    );
+
+    if (processedEvent == null) {
+      printIfDebug('[Txlemetry] Event dropped by beforeSend: $eventName');
+      return;
+    }
+
+    try {
+      // Use processed event properties (potentially modified by beforeSend)
+      final extracted = CaptureUtils.extractUserProperties(
+        properties: processedEvent.properties,
+        userProperties: processedEvent.userProperties,
+        userPropertiesSetOnce: processedEvent.userPropertiesSetOnce,
+      );
+
+      final extractedProperties = extracted.properties;
+      final extractedUserProperties = extracted.userProperties;
+      final extractedUserPropertiesSetOnce = extracted.userPropertiesSetOnce;
+
+      final normalizedProperties = extractedProperties != null
+          ? PropertyNormalizer.normalize(extractedProperties)
+          : null;
+      final normalizedUserProperties = extractedUserProperties != null
+          ? PropertyNormalizer.normalize(extractedUserProperties)
+          : null;
+      final normalizedUserPropertiesSetOnce =
+          extractedUserPropertiesSetOnce != null
+              ? PropertyNormalizer.normalize(extractedUserPropertiesSetOnce)
+              : null;
+
+      await _methodChannel.invokeMethod('capture', {
+        'eventName': processedEvent.event,
+        if (normalizedProperties != null) 'properties': normalizedProperties,
+        if (normalizedUserProperties != null)
+          'userProperties': normalizedUserProperties,
+        if (normalizedUserPropertiesSetOnce != null)
+          'userPropertiesSetOnce': normalizedUserPropertiesSetOnce,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on capture: $exception');
+    }
+  }
+
+  @override
+  Future<void> screen({
+    required String screenName,
+    Map<String, Object>? properties,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    // The screen name argument wins over a properties `$screen_name`.
+    // beforeSend still runs after this and can change the name.
+    final propsWithScreenName = <String, Object>{
+      ...?properties,
+      TxlemetryPropertyName.screenName: screenName,
+    };
+
+    // Apply beforeSend callback - screen events are captured as $screen
+    final processedEvent = await _runBeforeSend(
+      TxlemetryEventName.screen,
+      propsWithScreenName,
+    );
+    if (processedEvent == null) {
+      printIfDebug('[Txlemetry] Screen event dropped by beforeSend: $screenName');
+      return;
+    }
+
+    // If event name was changed, use regular capture() instead
+    if (processedEvent.event != TxlemetryEventName.screen) {
+      await capture(
+        eventName: processedEvent.event,
+        properties: processedEvent.properties?.cast<String, Object>(),
+      );
+      return;
+    }
+
+    // Get the (possibly modified) screen name from properties and remove it
+    final finalScreenName =
+        processedEvent.properties?[TxlemetryPropertyName.screenName] as String? ??
+            screenName;
+    // It will be added back by native sdk
+    processedEvent.properties?.remove(TxlemetryPropertyName.screenName);
+
+    try {
+      final normalizedProperties = processedEvent.properties?.isNotEmpty == true
+          ? PropertyNormalizer.normalize(
+              processedEvent.properties!.cast<String, Object>(),
+            )
+          : null;
+
+      await _methodChannel.invokeMethod('screen', {
+        'screenName': finalScreenName,
+        if (normalizedProperties != null) 'properties': normalizedProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on screen: $exception');
+    }
+  }
+
+  @override
+  Future<void> captureLog({
+    required String body,
+    TxlemetryLogSeverity level = TxlemetryLogSeverity.info,
+    Map<String, Object>? attributes,
+    String? traceId,
+    String? spanId,
+    int? traceFlags,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedAttributes =
+          attributes != null ? PropertyNormalizer.normalize(attributes) : null;
+
+      // Trace fields are camelCase here; the web handler remaps them to
+      // snake_case for txlemetry-js.
+      await _methodChannel.invokeMethod('captureLog', {
+        'body': body,
+        'level': level.name,
+        if (normalizedAttributes != null) 'attributes': normalizedAttributes,
+        if (traceId != null) 'traceId': traceId,
+        if (spanId != null) 'spanId': spanId,
+        // traceFlags 0 is meaningful (W3C sampled-false); only omit when null.
+        if (traceFlags != null) 'traceFlags': traceFlags,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on captureLog: $exception');
+    }
+  }
+
+  @override
+  Future<void> alias({required String alias}) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('alias', {'alias': alias});
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on alias: $exception');
+    }
+  }
+
+  @override
+  Future<String> getDistinctId() async {
+    if (!isSupportedPlatform()) {
+      return "";
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('distinctId');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on getDistinctId: $exception');
+      return "";
+    }
+  }
+
+  @override
+  Future<void> reset() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('reset');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on reset: $exception');
+    }
+  }
+
+  @override
+  Future<void> disable() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('disable');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on disable: $exception');
+    }
+  }
+
+  @override
+  Future<void> enable() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('enable');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on enable: $exception');
+    }
+  }
+
+  @override
+  Future<bool> isOptOut() async {
+    if (!isSupportedPlatform()) {
+      return true;
+    }
+
+    try {
+      final result = await _methodChannel.invokeMethod('isOptOut');
+      return result as bool? ?? true;
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on isOptOut: $exception');
+      return true;
+    }
+  }
+
+  @override
+  Future<void> debug(bool enabled) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('debug', {'debug': enabled});
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on debug: $exception');
+    }
+  }
+
+  @override
+  Future<bool> isFeatureEnabled(String key) async {
+    if (!isSupportedPlatform()) {
+      return false;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('isFeatureEnabled', {
+        'key': key,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on isFeatureEnabled: $exception');
+      return false;
+    }
+  }
+
+  @override
+  Future<void> reloadFeatureFlags() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('reloadFeatureFlags');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on reloadFeatureFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> setPersonPropertiesForFlags(
+    Map<String, Object> userProperties,
+  ) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedUserProperties =
+          PropertyNormalizer.normalize(userProperties);
+
+      await _methodChannel.invokeMethod('setPersonPropertiesForFlags', {
+        'userProperties': normalizedUserProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setPersonPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> resetPersonPropertiesForFlags() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('resetPersonPropertiesForFlags');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on resetPersonPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> setGroupPropertiesForFlags(
+    String groupType,
+    Map<String, Object> groupProperties,
+  ) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedGroupProperties =
+          PropertyNormalizer.normalize(groupProperties);
+
+      await _methodChannel.invokeMethod('setGroupPropertiesForFlags', {
+        'groupType': groupType,
+        'groupProperties': normalizedGroupProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setGroupPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> resetGroupPropertiesForFlags({String? groupType}) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('resetGroupPropertiesForFlags', {
+        if (groupType != null) 'groupType': groupType,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on resetGroupPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> group({
+    required String groupType,
+    required String groupKey,
+    Map<String, Object>? groupProperties,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedGroupProperties = groupProperties != null
+          ? PropertyNormalizer.normalize(groupProperties)
+          : null;
+
+      await _methodChannel.invokeMethod('group', {
+        'groupType': groupType,
+        'groupKey': groupKey,
+        if (normalizedGroupProperties != null)
+          'groupProperties': normalizedGroupProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on group: $exception');
+    }
+  }
+
+  @override
+  Future<Object?> getFeatureFlag({required String key}) async {
+    if (!isSupportedPlatform()) {
+      return null;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('getFeatureFlag', {'key': key});
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on getFeatureFlag: $exception');
+      return null;
+    }
+  }
+
+  @override
+  Future<Object?> getFeatureFlagPayload({required String key}) async {
+    if (!isSupportedPlatform()) {
+      return null;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('getFeatureFlagPayload', {
+        'key': key,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on getFeatureFlagPayload: $exception');
+      return null;
+    }
+  }
+
+  @override
+  Future<TxlemetryFeatureFlagResult?> getFeatureFlagResult({
+    required String key,
+    bool sendEvent = true,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return null;
+    }
+
+    try {
+      final result = await _methodChannel.invokeMethod('getFeatureFlagResult', {
+        'key': key,
+        'sendEvent': sendEvent,
+      });
+
+      // Native returns: { key, enabled, variant, payload }
+      return TxlemetryFeatureFlagResult.fromMap(result, key);
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on getFeatureFlagResult: $exception');
+      return null;
+    }
+  }
+
+  @override
+  Future<void> register(String key, Object value) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('register', {
+        'key': key,
+        'value': value,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on register: $exception');
+    }
+  }
+
+  @override
+  Future<void> unregister(String key) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('unregister', {'key': key});
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on unregister: $exception');
+    }
+  }
+
+  @override
+  Future<void> flush() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('flush');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on flush: $exception');
+    }
+  }
+
+  @override
+  Future<void> captureException({
+    required Object error,
+    StackTrace? stackTrace,
+    Map<String, Object>? properties,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final exceptionProps = DartExceptionProcessor.processException(
+        error: error,
+        stackTrace: stackTrace,
+        properties: properties,
+        inAppIncludes: _config?.errorTrackingConfig.inAppIncludes,
+        inAppExcludes: _config?.errorTrackingConfig.inAppExcludes,
+        inAppByDefault: _config?.errorTrackingConfig.inAppByDefault ?? true,
+      );
+
+      // Apply beforeSend callback - exception events are captured as $exception
+      final processedEvent = await _runBeforeSend(
+        TxlemetryEventName.exception,
+        exceptionProps.cast<String, Object>(),
+      );
+      if (processedEvent == null) {
+        printIfDebug(
+          '[Txlemetry] Exception event dropped by beforeSend: ${error.runtimeType}',
+        );
+        return;
+      }
+
+      // If event name was changed, use capture() instead
+      if (processedEvent.event != TxlemetryEventName.exception) {
+        await capture(
+          eventName: processedEvent.event,
+          properties: processedEvent.properties?.cast<String, Object>(),
+        );
+        return;
+      }
+
+      // Add timestamp from Flutter side (will be used and removed from native plugins)
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final normalizedData = processedEvent.properties != null
+          ? PropertyNormalizer.normalize(
+              processedEvent.properties!.cast<String, Object>(),
+            )
+          : <String, Object>{};
+
+      await _methodChannel.invokeMethod('captureException', {
+        'timestamp': timestamp,
+        'properties': normalizedData,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception in captureException: $exception');
+    }
+  }
+
+  @override
+  Future<void> addExceptionStep(
+    String message, {
+    Map<String, Object>? properties,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedProperties =
+          properties != null ? PropertyNormalizer.normalize(properties) : null;
+
+      await _methodChannel.invokeMethod('addExceptionStep', {
+        'message': message,
+        if (normalizedProperties != null) 'properties': normalizedProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on addExceptionStep: $exception');
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      return await _methodChannel.invokeMethod('close');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exeption on close: $exception');
+    }
+  }
+
+  @override
+  Future<String?> getSessionId() async {
+    if (!isSupportedPlatform()) {
+      return null;
+    }
+
+    try {
+      final sessionId = await _methodChannel.invokeMethod('getSessionId');
+      return sessionId;
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on getSessionId: $exception');
+      return null;
+    }
+  }
+
+  // For internal use
+  @override
+  Future<void> openUrl(String url) async {
+    if (!isSupportedPlatform()) {
+      printIfDebug('Cannot open url $url: Platform is not supported');
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('openUrl', url);
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on openUrl: $exception');
+    }
+  }
+
+  @override
+  Future<void> registerPushNotificationToken(
+    String deviceToken, {
+    String? appId,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+    if (isMacOS()) {
+      // The native macOS handler is a no-op (txlemetry-ios push is iOS-only).
+      printIfDebug(
+          'registerPushNotificationToken is not supported on macOS; token not registered.');
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('registerPushNotificationToken', {
+        'deviceToken': deviceToken,
+        if (appId != null) 'appId': appId,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on registerPushNotificationToken: $exception');
+    }
+  }
+
+  @override
+  Future<void> unregisterPushNotificationToken() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+    if (isMacOS()) {
+      // The native macOS handler is a no-op (txlemetry-ios push is iOS-only).
+      printIfDebug(
+          'unregisterPushNotificationToken is not supported on macOS; nothing to unregister.');
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('unregisterPushNotificationToken');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on unregisterPushNotificationToken: $exception');
+    }
+  }
+
+  @override
+  Future<void> capturePushNotificationOpened({
+    String? title,
+    String? subtitle,
+    String? body,
+    Map<String, Object?>? payload,
+    String? action,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('capturePushNotificationOpened', {
+        if (title != null) 'title': title,
+        if (subtitle != null) 'subtitle': subtitle,
+        if (body != null) 'body': body,
+        if (payload != null) 'payload': PropertyNormalizer.normalize(payload),
+        if (action != null) 'action': action,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on capturePushNotificationOpened: $exception');
+    }
+  }
+
+  @override
+  Future<void> startSessionRecording({bool resumeCurrent = true}) async {
+    if (!isSupportedPlatform() || isMacOS()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('startSessionRecording', resumeCurrent);
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on startSessionRecording: $exception');
+    }
+  }
+
+  @override
+  Future<void> stopSessionRecording() async {
+    if (!isSupportedPlatform() || isMacOS()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('stopSessionRecording');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on stopSessionRecording: $exception');
+    }
+  }
+
+  @override
+  Future<bool> isSessionReplayActive() async {
+    if (!isSupportedPlatform() || isMacOS()) {
+      return false;
+    }
+
+    try {
+      final result = await _methodChannel.invokeMethod('isSessionReplayActive');
+      return result as bool? ?? false;
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on isSessionReplayActive: $exception');
+      return false;
+    }
+  }
+}

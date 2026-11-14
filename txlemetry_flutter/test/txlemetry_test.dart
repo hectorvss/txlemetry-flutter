@@ -1,0 +1,866 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:txlemetry_flutter/txlemetry_flutter.dart';
+import 'package:txlemetry_flutter/src/txlemetry_flutter_platform_interface.dart';
+import 'package:txlemetry_flutter/src/txlemetry_internal_events.dart';
+import 'package:txlemetry_flutter/src/replay/mask/txlemetry_mask_controller.dart';
+import 'package:txlemetry_flutter/src/replay/screenshot/screenshot_capturer.dart';
+
+import 'txlemetry_flutter_platform_interface_fake.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('Txlemetry', () {
+    late TxlemetryFlutterPlatformFake fakePlatformInterface;
+
+    setUp(() async {
+      fakePlatformInterface = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fakePlatformInterface;
+      await Txlemetry().close();
+    });
+
+    test(
+      'setup passes config and onFeatureFlags callback to platform interface',
+      () async {
+        void testCallback() {}
+
+        final config = TxlemetryConfig(
+          'test_project_token',
+          onFeatureFlags: testCallback,
+        );
+
+        await Txlemetry().setup(config);
+
+        expect(fakePlatformInterface.receivedConfig, equals(config));
+        expect(
+          fakePlatformInterface.registeredOnFeatureFlagsCallback,
+          equals(testCallback),
+        );
+      },
+    );
+
+    test('Windows and Linux support is enabled by default', () {
+      expect(TxlemetryConfig('test_project_token').enableWindowsAndLinux, isTrue);
+    });
+
+    for (final platform in [TargetPlatform.windows, TargetPlatform.linux]) {
+      test('default config sets up on $platform', () async {
+        debugDefaultTargetPlatformOverride = platform;
+        try {
+          final config = TxlemetryConfig('test_project_token');
+          await Txlemetry().setup(config);
+          expect(fakePlatformInterface.receivedConfig, same(config));
+        } finally {
+          await Txlemetry().close();
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+    }
+
+    for (final platform in TargetPlatform.values) {
+      test('enableWindowsAndLinux only disables setup on $platform', () async {
+        debugDefaultTargetPlatformOverride = platform;
+        final originalHandler = FlutterError.onError;
+        void sentinelHandler(FlutterErrorDetails _) {}
+        FlutterError.onError = sentinelHandler;
+        try {
+          final config = TxlemetryConfig('test_project_token')
+            ..enableWindowsAndLinux = false
+            ..sessionReplay = true;
+          config.errorTrackingConfig.captureFlutterErrors = true;
+
+          await Txlemetry().setup(config);
+
+          if (!kIsWeb &&
+              (platform == TargetPlatform.windows ||
+                  platform == TargetPlatform.linux)) {
+            expect(fakePlatformInterface.receivedConfig, isNull);
+            expect(Txlemetry().config, isNull);
+            expect(FlutterError.onError, same(sentinelHandler));
+            expect(TxlemetryInternalEvents.sessionRecordingActive.value, isFalse);
+          } else {
+            expect(fakePlatformInterface.receivedConfig, same(config));
+            expect(Txlemetry().config, same(config));
+            expect(FlutterError.onError, isNot(same(sentinelHandler)));
+          }
+        } finally {
+          await Txlemetry().close();
+          FlutterError.onError = originalHandler;
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+    }
+
+    test(
+      'setup after close with different masking flags rebuilds the parser map',
+      () async {
+        final controller = TxlemetryMaskController.instance;
+        addTearDown(() => controller.refreshParsers(null));
+
+        final imagesMasked = TxlemetryConfig('test_project_token');
+        await Txlemetry().setup(imagesMasked);
+        expect(controller.parsers.keys, contains('RenderImage'));
+
+        await Txlemetry().close();
+        final imagesUnmasked = TxlemetryConfig('test_project_token')
+          ..sessionReplayConfig.maskAllImages = false;
+        await Txlemetry().setup(imagesUnmasked);
+        expect(controller.parsers.keys, isNot(contains('RenderImage')));
+        expect(controller.parsers.keys, contains('RenderParagraph'));
+      },
+    );
+
+    test(
+      'screenshot capturer resolves the live config after close and re-setup',
+      () async {
+        final first = TxlemetryConfig('test_project_token')
+          ..sessionReplayConfig.maskAllImages = false;
+        await Txlemetry().setup(first);
+        // TxlemetryWidget builds its capturer once and keeps it across a
+        // close()/setup() reconfigure, so the capturer has to resolve the
+        // config at read time rather than use the one it was constructed with.
+        final capturer = ScreenshotCapturer(first);
+        expect(capturer.effectiveConfig, same(first));
+
+        await Txlemetry().close();
+        final second = TxlemetryConfig('test_project_token');
+        await Txlemetry().setup(second);
+        expect(capturer.effectiveConfig, same(second));
+      },
+    );
+
+    group('setup with blank project token', () {
+      const blankProjectTokens = <String, String>{
+        'empty string': '',
+        'space': ' ',
+        'tab': '\t',
+        'mixed whitespace': ' \n\t ',
+      };
+
+      for (final entry in blankProjectTokens.entries) {
+        test('skips platform setup and integrations for ${entry.key}',
+            () async {
+          final originalFlutterErrorHandler = FlutterError.onError;
+          void sentinelHandler(FlutterErrorDetails _) {}
+          FlutterError.onError = sentinelHandler;
+
+          try {
+            final config = TxlemetryConfig(entry.value);
+            config.sessionReplay = true;
+            config.errorTrackingConfig.captureFlutterErrors = true;
+
+            await Txlemetry().setup(config);
+
+            expect(fakePlatformInterface.receivedConfig, isNull);
+            expect(Txlemetry().config, isNull);
+            expect(TxlemetryInternalEvents.sessionRecordingActive.value, isFalse);
+            expect(FlutterError.onError, same(sentinelHandler));
+          } finally {
+            FlutterError.onError = originalFlutterErrorHandler;
+          }
+        });
+      }
+    });
+
+    test(
+      'enable reinstalls Flutter error autocapture after disable',
+      () async {
+        final originalFlutterErrorHandler = FlutterError.onError;
+        FlutterError.onError = (_) {};
+
+        try {
+          final config = TxlemetryConfig('test_project_token');
+          config.errorTrackingConfig.captureFlutterErrors = true;
+          await Txlemetry().setup(config);
+
+          FlutterError.reportError(
+            FlutterErrorDetails(
+              exception: Exception('before-disable'),
+              context: ErrorDescription('issue 381 repro'),
+            ),
+          );
+          expect(fakePlatformInterface.capturedExceptions.length, 1);
+
+          fakePlatformInterface.capturedExceptions.clear();
+          await Txlemetry().optOut();
+
+          FlutterError.reportError(
+            FlutterErrorDetails(
+              exception: Exception('while-disabled'),
+              context: ErrorDescription('issue 381 repro'),
+            ),
+          );
+          expect(fakePlatformInterface.capturedExceptions, isEmpty);
+
+          await Txlemetry().optIn();
+
+          FlutterError.reportError(
+            FlutterErrorDetails(
+              exception: Exception('after-enable'),
+              context: ErrorDescription('issue 381 repro'),
+            ),
+          );
+          expect(fakePlatformInterface.capturedExceptions.length, 1);
+        } finally {
+          await Txlemetry().optOut();
+          FlutterError.onError = originalFlutterErrorHandler;
+        }
+      },
+    );
+  });
+
+  group('TxlemetryConfig', () {
+    test('sendFeatureFlagEvents forwards to sendFeatureFlagEvent', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      // ignore: deprecated_member_use_from_same_package
+      config.sendFeatureFlagEvents = false;
+
+      expect(config.sendFeatureFlagEvent, isFalse);
+      expect(config.toMap()['sendFeatureFlagEvents'], isFalse);
+    });
+
+    test('trims whitespace-sensitive config values in config and toMap', () {
+      final config = TxlemetryConfig(' \n test_project_token\t ');
+      config.host = ' \nhttps://app.txlemetry.com/\t ';
+
+      expect(config.projectToken, equals('test_project_token'));
+      expect(config.apiKey, equals('test_project_token'));
+      expect(config.host, equals('https://app.txlemetry.com/'));
+      expect(config.toMap()['projectToken'], equals('test_project_token'));
+      expect(config.toMap()['apiKey'], equals('test_project_token'));
+      expect(config.toMap()['host'], equals('https://app.txlemetry.com/'));
+    });
+
+    test('defaults a blank host after trimming whitespace', () {
+      final config = TxlemetryConfig('test_project_token');
+      config.host = ' \n\t ';
+
+      expect(config.host, equals('https://app.txlemetry.com'));
+      expect(config.toMap()['host'], equals('https://app.txlemetry.com'));
+    });
+
+    test('serializes the default rage-click configuration', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(config.rageClickConfig.toMap(), {
+        'enabled': true,
+        'thresholdPoints': 30.0,
+        'timeoutInterval': 1.0,
+        'minimumTapCount': 3,
+      });
+      expect(
+        config.toMap()['rageClickConfig'],
+        config.rageClickConfig.toMap(),
+      );
+    });
+
+    test('serializes overridden rage-click configuration', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..rageClickConfig.enabled = false
+        ..rageClickConfig.thresholdPoints = 12.5
+        ..rageClickConfig.timeoutInterval = const Duration(milliseconds: 500)
+        ..rageClickConfig.minimumTapCount = 5;
+
+      expect(config.rageClickConfig.toMap(), {
+        'enabled': false,
+        'thresholdPoints': 12.5,
+        'timeoutInterval': 0.5,
+        'minimumTapCount': 5,
+      });
+    });
+
+    test('session replay masks all platform views by default', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(config.sessionReplayConfig.maskAllPlatformViews, isTrue);
+
+      final replayConfig =
+          config.toMap()['sessionReplayConfig'] as Map<String, dynamic>;
+      expect(replayConfig.containsKey('maskAllPlatformViews'), isTrue);
+      expect(replayConfig['maskAllPlatformViews'], isTrue);
+
+      config.sessionReplayConfig.maskAllPlatformViews = false;
+
+      final updatedReplayConfig =
+          config.toMap()['sessionReplayConfig'] as Map<String, dynamic>;
+      expect(updatedReplayConfig['maskAllPlatformViews'], isFalse);
+    });
+
+    test('native screen bridge is opt-in (default false)', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(config.sessionReplayConfig.captureNativeScreens, isFalse);
+      expect(config.sessionReplayConfig.verifyScreenshotMaskAlignment, isFalse);
+
+      // The flag crosses the channel so the plugins can decide whether to
+      // start the occlusion detector.
+      final replayConfig =
+          config.toMap()['sessionReplayConfig'] as Map<String, dynamic>;
+      expect(replayConfig['captureNativeScreens'], isFalse);
+      expect(replayConfig['verifyScreenshotMaskAlignment'], isFalse);
+      // The mask flags cross too: the native plugins forward them to the
+      // native SDK unconditionally so bridged native screens honor the
+      // app-wide masking choice regardless of when the bridge is toggled.
+      expect(replayConfig['maskAllTexts'], isTrue);
+      expect(replayConfig['maskAllImages'], isTrue);
+    });
+
+    test('forwards Android native-screen mask alignment verification', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..sessionReplayConfig.verifyScreenshotMaskAlignment = true;
+
+      final replayConfig =
+          config.toMap()['sessionReplayConfig'] as Map<String, dynamic>;
+      expect(replayConfig['verifyScreenshotMaskAlignment'], isTrue);
+    });
+
+    test('omits bootstrap from toMap when not set', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(config.bootstrap, isNull);
+      expect(config.toMap().containsKey('bootstrap'), isFalse);
+    });
+
+    test('serializes an identified identity bootstrap', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..bootstrap = const TxlemetryBootstrapConfig(
+          distinctId: 'user-123',
+          isIdentifiedId: true,
+        );
+
+      final bootstrap = config.toMap()['bootstrap'] as Map<String, Object?>;
+      expect(bootstrap['distinctId'], equals('user-123'));
+      expect(bootstrap['isIdentifiedId'], isTrue);
+      expect(bootstrap.containsKey('featureFlags'), isFalse);
+      expect(bootstrap.containsKey('featureFlagPayloads'), isFalse);
+    });
+
+    test('defaults isIdentifiedId to false and serializes it', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..bootstrap = const TxlemetryBootstrapConfig(distinctId: 'anon-abc');
+
+      final bootstrap = config.toMap()['bootstrap'] as Map<String, Object?>;
+      expect(bootstrap['distinctId'], equals('anon-abc'));
+      expect(bootstrap['isIdentifiedId'], isFalse);
+    });
+
+    test('serializes feature flags and payloads without identity', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..bootstrap = const TxlemetryBootstrapConfig(
+          featureFlags: {'beta-ui': 'variant-a', 'legacy': true},
+          featureFlagPayloads: {
+            'beta-ui': {'color': 'blue'},
+            'legacy': null,
+          },
+        );
+
+      final bootstrap = config.toMap()['bootstrap'] as Map<String, Object?>;
+      expect(bootstrap.containsKey('distinctId'), isFalse);
+      expect(bootstrap['isIdentifiedId'], isFalse);
+      expect(
+        bootstrap['featureFlags'],
+        equals({'beta-ui': 'variant-a', 'legacy': true}),
+      );
+      expect(
+        bootstrap['featureFlagPayloads'],
+        equals({
+          'beta-ui': {'color': 'blue'},
+          'legacy': null,
+        }),
+      );
+    });
+
+    test('warns on a non-bool/String featureFlags value but still forwards it',
+        () {
+      final config = TxlemetryConfig('test_project_token')
+        ..bootstrap = const TxlemetryBootstrapConfig(
+          featureFlags: {'discount-tier': 2, 'beta-ui': 'variant-a'},
+        );
+
+      final logs = <String>[];
+      final map = runZoned(
+        config.toMap,
+        zoneSpecification: ZoneSpecification(
+          print: (_, __, ___, line) => logs.add(line),
+        ),
+      );
+
+      // The mismatched value is still forwarded; the native SDK drops it.
+      final bootstrap = map['bootstrap'] as Map<String, Object?>;
+      expect(
+        bootstrap['featureFlags'],
+        equals({'discount-tier': 2, 'beta-ui': 'variant-a'}),
+      );
+      // ...but the caller gets a breadcrumb for the ignored entry, and no
+      // false warning for the valid String value.
+      expect(logs.where((l) => l.contains('discount-tier')), isNotEmpty);
+      expect(logs.where((l) => l.contains('beta-ui')), isEmpty);
+    });
+  });
+
+  group('TxlemetryPlatformView', () {
+    testWidgets('defaults privacy to mask', (tester) async {
+      const view = TxlemetryPlatformView(child: SizedBox());
+      expect(view.privacy, TxlemetryPlatformViewPrivacy.mask);
+    });
+
+    testWidgets('keeps the requested capture privacy', (tester) async {
+      const view = TxlemetryPlatformView(
+        privacy: TxlemetryPlatformViewPrivacy.capture,
+        child: SizedBox(),
+      );
+      expect(view.privacy, TxlemetryPlatformViewPrivacy.capture);
+    });
+
+    testWidgets('renders its child unchanged', (tester) async {
+      await tester.pumpWidget(
+        const Directionality(
+          textDirection: TextDirection.ltr,
+          child: TxlemetryPlatformView(child: Text('child')),
+        ),
+      );
+      expect(find.text('child'), findsOneWidget);
+    });
+  });
+
+  group('getFeatureFlagResult', () {
+    late TxlemetryFlutterPlatformFake fakePlatformInterface;
+
+    setUp(() {
+      fakePlatformInterface = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fakePlatformInterface;
+    });
+
+    test('returns null for non-existent flag', () async {
+      final result = await Txlemetry().getFeatureFlagResult('non-existent');
+      expect(result, isNull);
+      expect(fakePlatformInterface.getFeatureFlagResultCalls, [
+        {'key': 'non-existent', 'sendEvent': true}
+      ]);
+    });
+
+    test('returns the platform result unchanged', () async {
+      final expected = TxlemetryFeatureFlagResult(
+        key: 'variant-flag',
+        enabled: true,
+        variant: 'control',
+        payload: {'discount': 10},
+      );
+      fakePlatformInterface.featureFlagResult = expected;
+      expect(
+          await Txlemetry().getFeatureFlagResult('variant-flag'), same(expected));
+      expect(fakePlatformInterface.getFeatureFlagResultCalls, [
+        {'key': 'variant-flag', 'sendEvent': true}
+      ]);
+    });
+
+    test('passes sendEvent=true by default', () async {
+      await Txlemetry().getFeatureFlagResult('test');
+
+      expect(
+        fakePlatformInterface.getFeatureFlagResultCalls.last['sendEvent'],
+        isTrue,
+      );
+    });
+
+    test('passes sendEvent=false when specified', () async {
+      await Txlemetry().getFeatureFlagResult('test', sendEvent: false);
+
+      expect(
+        fakePlatformInterface.getFeatureFlagResultCalls.last['sendEvent'],
+        isFalse,
+      );
+    });
+  });
+
+  group('setPersonProperties', () {
+    late TxlemetryFlutterPlatformFake fakePlatformInterface;
+
+    setUp(() {
+      fakePlatformInterface = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fakePlatformInterface;
+    });
+
+    test('passes userPropertiesToSet to platform interface', () async {
+      await Txlemetry().setPersonProperties(
+        userPropertiesToSet: {'name': 'John Doe', 'email': 'john@example.com'},
+      );
+
+      expect(fakePlatformInterface.setPersonPropertiesCalls.length, 1);
+      expect(
+        fakePlatformInterface
+            .setPersonPropertiesCalls.last['userPropertiesToSet'],
+        {'name': 'John Doe', 'email': 'john@example.com'},
+      );
+    });
+
+    test('passes userPropertiesToSetOnce to platform interface', () async {
+      await Txlemetry().setPersonProperties(
+        userPropertiesToSetOnce: {'date_of_first_login': '2024-03-01'},
+      );
+
+      expect(fakePlatformInterface.setPersonPropertiesCalls.length, 1);
+      expect(
+        fakePlatformInterface
+            .setPersonPropertiesCalls.last['userPropertiesToSetOnce'],
+        {'date_of_first_login': '2024-03-01'},
+      );
+    });
+
+    test('passes both property types to platform interface', () async {
+      await Txlemetry().setPersonProperties(
+        userPropertiesToSet: {'name': 'John Doe'},
+        userPropertiesToSetOnce: {'created_at': '2024-03-01'},
+      );
+
+      expect(fakePlatformInterface.setPersonPropertiesCalls.length, 1);
+      final call = fakePlatformInterface.setPersonPropertiesCalls.last;
+      expect(call['userPropertiesToSet'], {'name': 'John Doe'});
+      expect(call['userPropertiesToSetOnce'], {'created_at': '2024-03-01'});
+    });
+
+    test('can be called with no properties', () async {
+      await Txlemetry().setPersonProperties();
+
+      expect(fakePlatformInterface.setPersonPropertiesCalls.length, 1);
+      final call = fakePlatformInterface.setPersonPropertiesCalls.last;
+      expect(call['userPropertiesToSet'], isNull);
+      expect(call['userPropertiesToSetOnce'], isNull);
+    });
+  });
+
+  group('TxlemetryFeatureFlagResult', () {
+    test('equality', () {
+      final result1 = TxlemetryFeatureFlagResult(
+        key: 'flag',
+        enabled: true,
+        variant: 'a',
+        payload: 1,
+      );
+      final result2 = TxlemetryFeatureFlagResult(
+        key: 'flag',
+        enabled: true,
+        variant: 'a',
+        payload: 1,
+      );
+      final result3 = TxlemetryFeatureFlagResult(
+        key: 'flag',
+        enabled: true,
+        variant: 'b',
+        payload: 1,
+      );
+
+      expect(result1, equals(result2));
+      expect(result1, isNot(equals(result3)));
+    });
+
+    test('toString', () {
+      final result = TxlemetryFeatureFlagResult(
+        key: 'my-flag',
+        enabled: true,
+        variant: 'test',
+        payload: null,
+      );
+
+      expect(
+        result.toString(),
+        equals(
+          'TxlemetryFeatureFlagResult(key: my-flag, enabled: true, variant: test, payload: null)',
+        ),
+      );
+    });
+
+    test('fromMap returns null for null input', () {
+      final result = TxlemetryFeatureFlagResult.fromMap(null, 'fallback');
+      expect(result, isNull);
+    });
+
+    test('fromMap returns null for non-Map input', () {
+      final result = TxlemetryFeatureFlagResult.fromMap('not a map', 'fallback');
+      expect(result, isNull);
+    });
+
+    test('fromMap parses valid map', () {
+      final map = {
+        'key': 'my-flag',
+        'enabled': true,
+        'variant': 'test-variant',
+        'payload': {'data': 123},
+      };
+
+      final result = TxlemetryFeatureFlagResult.fromMap(map, 'fallback');
+
+      expect(result, isNotNull);
+      expect(result!.key, equals('my-flag'));
+      expect(result.enabled, isTrue);
+      expect(result.variant, equals('test-variant'));
+      expect(result.payload, equals({'data': 123}));
+    });
+
+    test('fromMap uses fallback key when map key is null', () {
+      final map = {'enabled': true, 'variant': null, 'payload': null};
+
+      final result = TxlemetryFeatureFlagResult.fromMap(map, 'fallback-key');
+
+      expect(result, isNotNull);
+      expect(result!.key, equals('fallback-key'));
+    });
+
+    test('fromMap defaults enabled to false when not in map', () {
+      final map = <String, dynamic>{'key': 'my-flag'};
+
+      final result = TxlemetryFeatureFlagResult.fromMap(map, 'fallback');
+
+      expect(result, isNotNull);
+      expect(result!.enabled, isFalse);
+    });
+  });
+
+  group('Txlemetry properties for flags', () {
+    late TxlemetryFlutterPlatformFake fake;
+
+    setUp(() async {
+      fake = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fake;
+      await Txlemetry().close();
+    });
+
+    test('setPersonPropertiesForFlags sets props and reloads by default',
+        () async {
+      await Txlemetry().setPersonPropertiesForFlags({'country': 'US'});
+
+      expect(fake.setPersonPropertiesForFlagsCalls, [
+        {'country': 'US'},
+      ]);
+      expect(fake.reloadFeatureFlagsCount, 1);
+    });
+
+    test(
+        'setPersonPropertiesForFlags skips reload when reloadFeatureFlags=false',
+        () async {
+      await Txlemetry().setPersonPropertiesForFlags(
+        {'country': 'US'},
+        reloadFeatureFlags: false,
+      );
+
+      expect(fake.setPersonPropertiesForFlagsCalls.length, 1);
+      expect(fake.reloadFeatureFlagsCount, 0);
+    });
+
+    test('setPersonPropertiesForFlags is a no-op for empty map', () async {
+      await Txlemetry().setPersonPropertiesForFlags({});
+
+      expect(fake.setPersonPropertiesForFlagsCalls, isEmpty);
+      expect(fake.reloadFeatureFlagsCount, 0);
+    });
+
+    test('resetPersonPropertiesForFlags resets and reloads by default',
+        () async {
+      await Txlemetry().resetPersonPropertiesForFlags();
+
+      expect(fake.resetPersonPropertiesForFlagsCount, 1);
+      expect(fake.reloadFeatureFlagsCount, 1);
+    });
+
+    test('setGroupPropertiesForFlags passes groupType and reloads', () async {
+      await Txlemetry().setGroupPropertiesForFlags(
+        'organization',
+        {'name': 'ACME'},
+      );
+
+      expect(fake.setGroupPropertiesForFlagsCalls, [
+        {
+          'groupType': 'organization',
+          'groupProperties': {'name': 'ACME'},
+        },
+      ]);
+      expect(fake.reloadFeatureFlagsCount, 1);
+    });
+
+    test('setGroupPropertiesForFlags is a no-op for empty map', () async {
+      await Txlemetry().setGroupPropertiesForFlags('organization', {});
+
+      expect(fake.setGroupPropertiesForFlagsCalls, isEmpty);
+      expect(fake.reloadFeatureFlagsCount, 0);
+    });
+
+    test('resetGroupPropertiesForFlags forwards groupType and reloads',
+        () async {
+      await Txlemetry().resetGroupPropertiesForFlags(groupType: 'organization');
+
+      expect(fake.resetGroupPropertiesForFlagsCalls, ['organization']);
+      expect(fake.reloadFeatureFlagsCount, 1);
+    });
+
+    test('resetGroupPropertiesForFlags forwards null when groupType omitted',
+        () async {
+      await Txlemetry().resetGroupPropertiesForFlags(reloadFeatureFlags: false);
+
+      expect(fake.resetGroupPropertiesForFlagsCalls, [null]);
+      expect(fake.reloadFeatureFlagsCount, 0);
+    });
+  });
+
+  group('Txlemetry addExceptionStep', () {
+    late TxlemetryFlutterPlatformFake fake;
+
+    setUp(() async {
+      fake = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fake;
+      await Txlemetry().close();
+    });
+
+    test('forwards message and properties to the platform', () async {
+      await Txlemetry().addExceptionStep(
+        'User tapped Checkout',
+        properties: {'screen': 'cart'},
+      );
+
+      expect(fake.addExceptionStepCalls, [
+        {
+          'message': 'User tapped Checkout',
+          'properties': {'screen': 'cart'},
+        },
+      ]);
+    });
+
+    test('forwards message without properties', () async {
+      await Txlemetry().addExceptionStep('Opened modal');
+
+      expect(fake.addExceptionStepCalls, [
+        {'message': 'Opened modal', 'properties': null},
+      ]);
+    });
+
+    test('is a no-op for an empty message', () async {
+      await Txlemetry().addExceptionStep('');
+
+      expect(fake.addExceptionStepCalls, isEmpty);
+    });
+
+    test('is a no-op for a whitespace-only message', () async {
+      await Txlemetry().addExceptionStep('   \t\n');
+
+      expect(fake.addExceptionStepCalls, isEmpty);
+    });
+
+    test('is a no-op when exception steps are disabled', () async {
+      final config = TxlemetryConfig('test_project_token')
+        ..errorTrackingConfig.exceptionSteps.enabled = false;
+      await Txlemetry().setup(config);
+
+      await Txlemetry().addExceptionStep('User tapped Checkout');
+
+      expect(fake.addExceptionStepCalls, isEmpty);
+    });
+  });
+
+  group('TxlemetryExceptionStepsConfig', () {
+    test('toMap serializes the native defaults', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(
+        config.errorTrackingConfig.exceptionSteps.toMap(),
+        {'enabled': true, 'maxBytes': 32768},
+      );
+    });
+
+    test('toMap reflects overridden values', () {
+      final config = TxlemetryConfig('test_project_token')
+        ..errorTrackingConfig.exceptionSteps.enabled = false
+        ..errorTrackingConfig.exceptionSteps.maxBytes = 1024;
+
+      expect(
+        config.errorTrackingConfig.exceptionSteps.toMap(),
+        {'enabled': false, 'maxBytes': 1024},
+      );
+    });
+  });
+
+  group('Txlemetry push notifications', () {
+    late TxlemetryFlutterPlatformFake fakePlatformInterface;
+
+    setUp(() {
+      fakePlatformInterface = TxlemetryFlutterPlatformFake();
+      TxlemetryFlutterPlatformInterface.instance = fakePlatformInterface;
+    });
+
+    test('registerPushNotificationToken passes deviceToken and appId',
+        () async {
+      await Txlemetry().registerPushNotificationToken(
+        'token-abc',
+        appId: 'com.example.app',
+      );
+
+      expect(fakePlatformInterface.registeredPushTokens, [
+        (deviceToken: 'token-abc', appId: 'com.example.app'),
+      ]);
+    });
+
+    test('registerPushNotificationToken leaves appId null when omitted',
+        () async {
+      await Txlemetry().registerPushNotificationToken('token-abc');
+
+      expect(fakePlatformInterface.registeredPushTokens.single.appId, isNull);
+    });
+
+    test('unregisterPushNotificationToken reaches the platform interface',
+        () async {
+      await Txlemetry().unregisterPushNotificationToken();
+
+      expect(fakePlatformInterface.unregisterPushTokenCalls, 1);
+    });
+
+    test('capturePushNotificationOpened passes every field', () async {
+      await Txlemetry().capturePushNotificationOpened(
+        title: 'Title',
+        subtitle: 'Subtitle',
+        body: 'Body',
+        payload: {'txlemetry': '{"campaign_id":"x"}'},
+        action: 'reply',
+      );
+
+      final call = fakePlatformInterface.capturedPushOpened.single;
+      expect(call.title, 'Title');
+      expect(call.subtitle, 'Subtitle');
+      expect(call.body, 'Body');
+      expect(call.payload, {'txlemetry': '{"campaign_id":"x"}'});
+      expect(call.action, 'reply');
+    });
+  });
+
+  group('TxlemetryConfig push notification defaults', () {
+    test('both capture flags default to true, matching the native SDKs', () {
+      final config = TxlemetryConfig('test_project_token');
+
+      expect(config.capturePushNotificationSubscriptions, isTrue);
+      expect(config.capturePushNotificationOpened, isTrue);
+      expect(config.pushIdentityProvider, isNull);
+    });
+
+    test('toMap forwards the flags and the provider-enabled marker', () {
+      final map = TxlemetryConfig('test_project_token').toMap();
+
+      expect(map['capturePushNotificationSubscriptions'], isTrue);
+      expect(map['capturePushNotificationOpened'], isTrue);
+      expect(map['pushIdentityProviderEnabled'], isFalse);
+
+      final withOverrides = TxlemetryConfig('test_project_token')
+        ..capturePushNotificationSubscriptions = false
+        ..capturePushNotificationOpened = false
+        ..pushIdentityProvider = (_, __) async => 'tok';
+
+      expect(
+        withOverrides.toMap()['capturePushNotificationSubscriptions'],
+        isFalse,
+      );
+      expect(withOverrides.toMap()['capturePushNotificationOpened'], isFalse);
+      expect(withOverrides.toMap()['pushIdentityProviderEnabled'], isTrue);
+    });
+  });
+}

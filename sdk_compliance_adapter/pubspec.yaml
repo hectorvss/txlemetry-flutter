@@ -1,0 +1,16 @@
+name: txlemetry_flutter_sdk_compliance_adapter
+publish_to: none
+resolution: workspace
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  txlemetry_flutter:
+    path: ../txlemetry_flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

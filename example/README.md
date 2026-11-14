@@ -1,0 +1,42 @@
+# txlemetry_flutter_example
+
+Demonstrates how to use the txlemetry_flutter plugin.
+
+## Getting Started
+
+This project is a starting point for a Flutter application.
+
+A few resources to get you started if this is your first Flutter project:
+
+- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.
+
+## Running web example
+
+```bash
+# release mode
+rm -rf build/web
+flutter build web --source-maps
+txlemetry-cli sourcemap inject --directory build/web --release-name txlemetry_flutter_example --release-version 1.0.0 --build 42
+# check the sourcemaps has chunk_id and release_id injected (*.js.map file)
+# check the js file has _txlemetryChunkIds injected (*.js file)
+# check the chunk_id and _txlemetryChunkIds match
+txlemetry-cli sourcemap upload --directory build/web --release-name txlemetry_flutter_example --release-version 1.0.0 --build 42
+cd build/web
+# https://pub.dev/packages/dhttpd
+dhttpd
+```
+
+## Running Apple example
+
+```
+# needs device pairing - enable debug mode on the device
+# make sure you have a valid team in Xcode, go to Signing & Capabilities
+flutter devices
+flutter run --release -d Manoel --verbose
+# replace Manoel with your device's name/id
+```

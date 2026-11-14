@@ -1,0 +1,266 @@
+import 'package:flutter/material.dart';
+
+import '../models/txlemetry_display_survey.dart';
+import '../models/txlemetry_survey_question_type.dart';
+import '../models/survey_appearance.dart';
+import '../models/survey_callbacks.dart';
+import '../models/txlemetry_display_link_question.dart';
+import '../models/txlemetry_display_rating_question.dart';
+import '../models/txlemetry_display_choice_question.dart';
+import '../models/txlemetry_display_survey_text_content_type.dart';
+import '../../txlemetry_flutter_platform_interface.dart';
+
+import 'link_question.dart';
+import 'open_text_question.dart';
+import 'rating_question.dart';
+import 'choice_question.dart';
+import 'confirmation_message.dart';
+import 'survey_icon.dart';
+import 'intro_message.dart';
+
+/// A bottom sheet that displays a survey to the user.
+class SurveyBottomSheet extends StatefulWidget {
+  final TxlemetryDisplaySurvey survey;
+  final OnSurveyShown onShown;
+  final OnSurveyResponse onResponse;
+  final OnSurveyClosed onClosed;
+  final SurveyAppearance appearance;
+
+  const SurveyBottomSheet({
+    super.key,
+    required this.survey,
+    required this.onShown,
+    required this.onResponse,
+    required this.onClosed,
+    required this.appearance,
+  });
+
+  @override
+  State<SurveyBottomSheet> createState() => _SurveyBottomSheetState();
+}
+
+class _SurveyBottomSheetState extends State<SurveyBottomSheet> {
+  late int _currentIndex = widget.survey.initialQuestionIndex;
+  bool _isCompleted = false;
+  bool _isSubmitting = false;
+  // Advancing past the intro is a pure UI transition: no response is recorded
+  // and no survey event is sent. The X button keeps closing the survey.
+  // The intro has no default header, so an intro with no copy at all is
+  // skipped instead of drawing an empty sheet with a lone button.
+  late bool _showingIntroScreen = widget.survey.initialQuestionIndex == 0 &&
+      (widget.survey.appearance?.displayIntroScreen ?? false) &&
+      ((widget.survey.appearance?.introScreenHeader?.isNotEmpty ?? false) ||
+          (widget.survey.appearance?.introScreenDescription?.isNotEmpty ??
+              false));
+
+  @override
+  void initState() {
+    super.initState();
+    widget.onShown(widget.survey);
+  }
+
+  void _handleClose() {
+    widget.onClosed(widget.survey);
+    Navigator.of(context).pop();
+  }
+
+  Future<void> _submitResponse(Object? response, {String? link}) async {
+    if (_isSubmitting || _isCompleted) return;
+    setState(() => _isSubmitting = true);
+    try {
+      final nextQuestion = await widget.onResponse(
+        widget.survey,
+        _currentIndex,
+        response,
+      );
+      if (!mounted || nextQuestion == null) return;
+
+      // Open the URL if provided
+      if (link != null && link.isNotEmpty) {
+        await TxlemetryFlutterPlatformInterface.instance.openUrl(link);
+      }
+
+      // Update state
+      if (!mounted) return;
+      if (nextQuestion.isSurveyCompleted &&
+          !widget.appearance.displayThankYouMessage) {
+        _handleClose();
+        return;
+      }
+      setState(() {
+        _currentIndex = nextQuestion.questionIndex;
+        _isCompleted = nextQuestion.isSurveyCompleted;
+      });
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
+  }
+
+  Widget _buildQuestion(BuildContext context) {
+    final survey = widget.survey;
+    final currentQuestion = survey.questions[_currentIndex];
+
+    switch (currentQuestion.type) {
+      case TxlemetrySurveyQuestionType.openText:
+        final appearance =
+            SurveyAppearance.fromTxlemetry(widget.survey.appearance);
+        return OpenTextQuestion(
+          key: ValueKey('open_text_question_$_currentIndex'),
+          question: currentQuestion.question,
+          description: currentQuestion.description,
+          descriptionContentType: currentQuestion.descriptionContentType,
+          appearance: appearance,
+          buttonText: surveyQuestionButtonLabel(
+            currentQuestion.buttonText,
+            appearance.submitButtonText,
+          ),
+          optional: currentQuestion.optional,
+          onSubmit: _submitResponse,
+        );
+      case TxlemetrySurveyQuestionType.link:
+        final linkQuestion = currentQuestion as TxlemetryDisplayLinkQuestion;
+        return LinkQuestion(
+          key: ValueKey('link_question_$_currentIndex'),
+          question: linkQuestion.question,
+          description: linkQuestion.description,
+          descriptionContentType: linkQuestion.descriptionContentType,
+          appearance: SurveyAppearance.fromTxlemetry(widget.survey.appearance),
+          buttonText: linkQuestion.buttonText,
+          link: linkQuestion.link,
+          // Send survey response (true for link questions)
+          onPressed: () => _submitResponse(
+            true, // Boolean response for link questions
+            link: linkQuestion.link,
+          ),
+        );
+      case TxlemetrySurveyQuestionType.rating:
+        final ratingQuestion = currentQuestion as TxlemetryDisplayRatingQuestion;
+
+        return RatingQuestion(
+          key: ValueKey('rating_question_$_currentIndex'),
+          question: ratingQuestion.question,
+          description: ratingQuestion.description,
+          descriptionContentType: ratingQuestion.descriptionContentType,
+          appearance: SurveyAppearance.fromTxlemetry(widget.survey.appearance),
+          buttonText: ratingQuestion.buttonText,
+          optional: ratingQuestion.optional,
+          skipSubmitButton: ratingQuestion.skipSubmitButton,
+          scaleLowerBound: ratingQuestion.scaleLowerBound,
+          scaleUpperBound: ratingQuestion.scaleUpperBound,
+          type: ratingQuestion.ratingType,
+          lowerBoundLabel: ratingQuestion.lowerBoundLabel,
+          upperBoundLabel: ratingQuestion.upperBoundLabel,
+          // Pass integer directly
+          onSubmit: _submitResponse,
+        );
+      case TxlemetrySurveyQuestionType.singleChoice:
+      case TxlemetrySurveyQuestionType.multipleChoice:
+        final choiceQuestion = currentQuestion as TxlemetryDisplayChoiceQuestion;
+        return ChoiceQuestionWidget(
+          key: ValueKey('choice_question_$_currentIndex'),
+          question: choiceQuestion.question,
+          description: choiceQuestion.description,
+          descriptionContentType: choiceQuestion.descriptionContentType,
+          choices: choiceQuestion.choices,
+          shuffleOptions: choiceQuestion.shuffleOptions,
+          skipSubmitButton: choiceQuestion.skipSubmitButton,
+          appearance: SurveyAppearance.fromTxlemetry(widget.survey.appearance),
+          buttonText: choiceQuestion.buttonText,
+          optional: choiceQuestion.optional,
+          hasOpenChoice: choiceQuestion.hasOpenChoice,
+          isMultipleChoice:
+              currentQuestion.type == TxlemetrySurveyQuestionType.multipleChoice,
+          // A selection is a List<String> (one entry for single choice).
+          // An empty optional skip is null.
+          onSubmit: _submitResponse,
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mediaQuery = MediaQuery.of(context);
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          _handleClose();
+        }
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: widget.appearance.backgroundColor,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        child: SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(bottom: mediaQuery.viewInsets.bottom),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Header
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        icon: SurveyIcon(
+                          type: SurveyIconType.close,
+                          color: widget.appearance.closeButtonColor,
+                        ),
+                        onPressed: () => _handleClose(),
+                      ),
+                    ],
+                  ),
+                ),
+                // Content
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (_isCompleted)
+                            ConfirmationMessage(
+                              onClose: _handleClose,
+                              appearance: widget.appearance,
+                              thankYouMessageDescriptionContentType: widget
+                                      .survey
+                                      .appearance
+                                      ?.thankYouMessageDescriptionContentType ??
+                                  TxlemetryDisplaySurveyTextContentType.text,
+                            )
+                          else if (_showingIntroScreen)
+                            IntroMessage(
+                              onStart: () =>
+                                  setState(() => _showingIntroScreen = false),
+                              appearance: widget.appearance,
+                              introScreenDescriptionContentType: widget
+                                      .survey
+                                      .appearance
+                                      ?.introScreenDescriptionContentType ??
+                                  TxlemetryDisplaySurveyTextContentType.text,
+                            )
+                          else
+                            AbsorbPointer(
+                              absorbing: _isSubmitting,
+                              child: _buildQuestion(context),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,86 @@
+name: CI
+
+# Unit tests and package checks run on every push. The example builds need the native SDKs to be published:
+# Android resolves com.txlemetry:txlemetry-android 4.0.0 from Maven Central, and iOS/macOS resolve the
+# Txlemetry Swift package / pod 4.0.0 from github.com/hectorvss/txlemetry-ios.
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    FLUTTER_VERSION: 3.47.7
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            - name: Install Flutter
+              run: |
+                  git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+                  echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+            - run: flutter --version
+            - run: flutter pub get
+            - name: Unit tests
+              working-directory: txlemetry_flutter
+              run: flutter test --no-pub
+            - name: Package check
+              working-directory: txlemetry_flutter
+              run: flutter pub publish --dry-run
+
+    build-example:
+        name: build example (${{ matrix.platform }})
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - platform: web
+                      runner: ubuntu-latest
+                      command: flutter build web --release
+                    - platform: linux
+                      runner: ubuntu-latest
+                      command: flutter build linux --release
+                    - platform: windows
+                      runner: windows-latest
+                      command: flutter build windows --release
+                    - platform: android
+                      runner: ubuntu-latest
+                      command: flutter build apk --release
+                    - platform: ios
+                      runner: macos-15
+                      command: flutter build ios --release --no-codesign
+                    - platform: macos
+                      runner: macos-15
+                      command: flutter build macos --release
+        defaults:
+            run:
+                shell: bash
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            - name: Install Flutter
+              run: |
+                  git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+                  echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+            - name: Linux build dependencies
+              if: matrix.platform == 'linux'
+              run: sudo apt-get update && sudo apt-get install -y ninja-build libgtk-3-dev clang cmake pkg-config
+            - name: Use JDK 17
+              if: matrix.platform == 'android'
+              run: echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+            - run: flutter pub get
+            - name: Build
+              working-directory: example
+              run: ${{ matrix.command }}

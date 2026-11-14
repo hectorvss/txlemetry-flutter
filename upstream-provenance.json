@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/PostHog/posthog-flutter",
+  "tag": "5.55.0",
+  "commit": "7d28032aa20a858761f2514b428a02825b0fdc7b",
+  "archiveSha256": "63af38c95d5c417c4b453748bc2dbb41419269ee3b21f3a978abbf54d346bcce",
+  "releasePublishedAt": "2026-10-13T22:36:30Z",
+  "materializedInternalSymlinks": 2,
+  "validation": "pending"
+}
