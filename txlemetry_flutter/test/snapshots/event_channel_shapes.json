@@ -76,7 +76,7 @@
     "method": "group",
     "arguments": {
       "groupType": "company",
-      "groupKey": "posthog",
+      "groupKey": "txlemetry",
       "groupProperties": {
         "industry": "analytics",
         "employees": 100

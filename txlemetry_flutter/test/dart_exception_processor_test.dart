@@ -379,7 +379,7 @@ void main() {
       expect(tail[2]['filename'], 'main.dart');
       // Interior Txlemetry frame is preserved (only leading ones are stripped).
       expect(tail[1]['package'], 'txlemetry_flutter');
-      expect(tail[1]['filename'], 'posthog.dart');
+      expect(tail[1]['filename'], 'txlemetry.dart');
       // Entry point is first of the three.
       expect(tail[0]['package'], 'some_lib');
       expect(tail[0]['filename'], 'lib.dart');

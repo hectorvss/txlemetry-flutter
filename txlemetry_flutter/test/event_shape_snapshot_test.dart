@@ -227,7 +227,7 @@ void main() {
       subtitle: 'Pickup available',
       body: 'Tap to view order ord_123',
       payload: {
-        'txlemetry': {'campaign_id': 'campaign_123', 'delivery': null},
+        'posthog': {'campaign_id': 'campaign_123', 'delivery': null},
       },
       action: 'view_order',
     );
